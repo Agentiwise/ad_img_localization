@@ -142,13 +142,13 @@ def main():
     st.set_page_config(page_title="AI Image Transformation Pipeline", layout="wide")
     st.title("AI Marketing Image Localization")
     st.markdown(f"Upload your images, add your openrouter key and get the perfect images for any language you want")
-    
+
     # Sidebar for Inputs
     with st.sidebar:
         st.header("Configuration")
         api_key = st.text_input("OpenRouter API Key", type="password")
         language = st.text_input("Output language", type="default")
-        additional_instructions = st.text_input("Additional_instructions", type="default")
+        additional_instructions = st.text_input("Additional Instructions (optional)", type="default")
         uploaded_files = st.file_uploader("Upload Images", type=['png', 'jpg', 'jpeg'], accept_multiple_files=True)
         process_btn = st.button("Process Images", type="primary")
 
