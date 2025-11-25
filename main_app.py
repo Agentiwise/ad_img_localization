@@ -140,8 +140,8 @@ def generate_image_from_analysis(api_key, analysis_text, base64_original_image):
 
 def main():
     st.set_page_config(page_title="AI Image Transformation Pipeline", layout="wide")
-    st.title("AI Image Analysis & Generation")
-    st.markdown(f"Using **{ANALYSIS_MODEL}** for analysis and **{GENERATION_MODEL}** for generation.")
+    st.title("AI Marketing Image Localization")
+    st.markdown(f"Upload your images, add your openrouter key and get the perfect images for any language you want")
 
     # Sidebar for Inputs
     with st.sidebar:
@@ -246,4 +246,5 @@ def main():
         st.warning("Please enter your OpenRouter API Key.")
 
 if __name__ == "__main__":
+
     main()
