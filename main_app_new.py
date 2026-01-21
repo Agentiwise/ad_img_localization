@@ -1,5 +1,6 @@
 import streamlit as st
-import requests
+import aiohttp
+import asyncio
 import json
 import base64
 import io
@@ -8,8 +9,7 @@ import time
 import os
 import re
 import mimetypes
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from requests.exceptions import RequestException, Timeout
+from requests.exceptions import RequestException
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -75,7 +75,7 @@ def verify_drive_folder_access(folder_id: str, svc) -> bool:
             fileId=folder_id,
             fields="id, name"
         ).execute()
-        st.write(f"📁 Drive folder verified: {folder['name']}")
+        st.info(f"📁 Drive folder verified: {folder['name']}")
         return True
     except HttpError as e:
         st.error("❌ Drive folder not accessible. Share it with the service account.")
@@ -99,7 +99,7 @@ def drive_upload(local_path: str, folder_id: str, svc):
     ).execute()
 
 # -------------------------------------------------
-# OPENROUTER HELPERS
+# ASYNC OPENROUTER HELPERS
 # -------------------------------------------------
 
 def encode_bytes_to_base64(raw_bytes: bytes, mime_type: str) -> str:
@@ -107,12 +107,10 @@ def encode_bytes_to_base64(raw_bytes: bytes, mime_type: str) -> str:
     return f"data:{mime_type};base64,{base64.b64encode(raw_bytes).decode()}"
 
 
-def encode_image_to_base64(uploaded_file):
-    raw = uploaded_file.getvalue()
-    return f"data:{uploaded_file.type};base64,{base64.b64encode(raw).decode()}"
-
-
-def robust_openrouter_call(api_key, payload, label):
+async def async_openrouter_call(session: aiohttp.ClientSession, api_key: str, payload: dict, label: str):
+    """
+    Async HTTP call to OpenRouter with retry logic.
+    """
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -124,25 +122,25 @@ def robust_openrouter_call(api_key, payload, label):
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.post(
+            async with session.post(
                 OPENROUTER_URL,
                 headers=headers,
                 json=payload,
-                timeout=REQUEST_TIMEOUT,
-            )
-            response.raise_for_status()
-            return response.json()
-        except (Timeout, RequestException) as e:
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_error = str(e)
-            time.sleep(2 ** (attempt - 1))
+            await asyncio.sleep(2 ** (attempt - 1))
 
     raise RuntimeError(f"{label} failed after retries: {last_error}")
 
 # -------------------------------------------------
-# AI STEPS
+# ASYNC AI STEPS
 # -------------------------------------------------
 
-def analyze_localization(api_key, image_b64, language, extra):
+async def async_analyze_localization(session, api_key, image_b64, language, extra):
     payload = {
         "model": ANALYSIS_MODEL,
         "messages": [{
@@ -156,7 +154,7 @@ Translate:
 
 Do NOT translate:
 - Any text printed on the physical product or packaging.
-- Logos, brand names, model numbers, trademarks, certifications.
+- Logos, brand names, model numbers, trademarks, certifications, addresses.
 - URLs, QR codes, barcodes, watermarks, icons.
 
 If unreadable but clearly overlay text, mark as UNREADABLE.
@@ -176,11 +174,11 @@ Additional user instructions:
             ],
         }],
     }
-    r = robust_openrouter_call(api_key, payload, "LOCALIZATION")
+    r = await async_openrouter_call(session, api_key, payload, "LOCALIZATION")
     return r["choices"][0]["message"]["content"]
 
 
-def analyze_aspect(api_key, image_b64, ratio):
+async def async_analyze_aspect(session, api_key, image_b64, ratio):
     payload = {
         "model": ANALYSIS_MODEL,
         "messages": [{
@@ -192,7 +190,7 @@ You are an expert visual layout and image composition specialist.
 Analyze the provided image and describe how to adapt it to a {ratio} aspect ratio, while still keeping all of the original elements of the image.
 
 Guidelines:
-- Preserve the main subject and focal point
+- Preserve the main subject, background and focal point
 - Avoid aggressive cropping of oriiginal elements, rather reposition or resize them
 - Prefer intelligent expansion, repositioning, or background continuation
 - Maintain natural proportions
@@ -209,11 +207,11 @@ just the prefix and the description no preamble or commnetary or explanation
             ],
         }],
     }
-    r = robust_openrouter_call(api_key, payload, "ASPECT")
+    r = await async_openrouter_call(session, api_key, payload, "ASPECT")
     return r["choices"][0]["message"]["content"]
 
 
-def generate_image(api_key, prompt, image_b64, ratio):
+async def async_generate_image(session, api_key, prompt, image_b64, ratio):
     payload = {
         "model": GENERATION_MODEL,
         "messages": [{
@@ -229,60 +227,93 @@ def generate_image(api_key, prompt, image_b64, ratio):
     if ratio:
         payload["image_config"] = {"aspect_ratio": ratio, "image_size": "2K"}
 
-    r = robust_openrouter_call(api_key, payload, "GENERATION")
+    r = await async_openrouter_call(session, api_key, payload, "GENERATION")
     return r["choices"][0]["message"]["images"][0]["image_url"]["url"]
 
 # -------------------------------------------------
-# PARALLEL WORKER (THREAD-SAFE VERSION)
+# ASYNC PARALLEL WORKER
 # -------------------------------------------------
 
-def process_image_from_bytes(api_key, file_bytes, file_name, file_type, language, extra, ratio):
+async def async_process_single_image(
+    session: aiohttp.ClientSession,
+    api_key: str,
+    file_data: dict,
+    language: str,
+    extra: str,
+    ratio: str | None,
+    index: int,
+):
     """
-    Process a single image from raw bytes (thread-safe).
+    Process a single image asynchronously.
+    Returns result dict with timing info.
+    """
+    start_time = time.time()
+    file_name = file_data["name"]
     
-    Args:
-        api_key: OpenRouter API key
-        file_bytes: Raw image bytes (read in main thread)
-        file_name: Original filename
-        file_type: MIME type (e.g., 'image/jpeg')
-        language: Target language for localization
-        extra: Additional instructions
-        ratio: Target aspect ratio or None
+    try:
+        img_b64 = encode_bytes_to_base64(file_data["bytes"], file_data["type"])
+
+        # Run localization analysis
+        localization = await async_analyze_localization(session, api_key, img_b64, language, extra)
+        prompt = localization
+
+        # Run aspect analysis if needed
+        if ratio:
+            aspect = await async_analyze_aspect(session, api_key, img_b64, ratio)
+            prompt = f"{aspect}\n\n{localization}"
+
+        # Generate the final image
+        image_url = await async_generate_image(session, api_key, prompt, img_b64, ratio)
+
+        elapsed = time.time() - start_time
+        
+        return {
+            "success": True,
+            "index": index,
+            "original_name": file_name,
+            "original_b64": img_b64,  # Store original for side-by-side display
+            "generated_image": image_url,
+            "elapsed_seconds": round(elapsed, 2),
+        }
+    
+    except Exception as e:
+        elapsed = time.time() - start_time
+        return {
+            "success": False,
+            "index": index,
+            "original_name": file_name,
+            "original_b64": encode_bytes_to_base64(file_data["bytes"], file_data["type"]),
+            "error": str(e),
+            "elapsed_seconds": round(elapsed, 2),
+        }
+
+
+async def process_all_images_async(
+    api_key: str,
+    file_data_list: list,
+    language: str,
+    extra: str,
+    ratio: str | None,
+):
     """
-    img_b64 = encode_bytes_to_base64(file_bytes, file_type)
-
-    localization = analyze_localization(api_key, img_b64, language, extra)
-    prompt = localization
-
-    if ratio:
-        aspect = analyze_aspect(api_key, img_b64, ratio)
-        prompt = f"{aspect}\n\n{localization}"
-
-    image_url = generate_image(api_key, prompt, img_b64, ratio)
-
-    return {
-        "original_name": file_name,
-        "generated_image": image_url,
-    }
-
-
-def process_image(api_key, file, language, extra, ratio):
-    """Legacy function kept for compatibility."""
-    img_b64 = encode_image_to_base64(file)
-
-    localization = analyze_localization(api_key, img_b64, language, extra)
-    prompt = localization
-
-    if ratio:
-        aspect = analyze_aspect(api_key, img_b64, ratio)
-        prompt = f"{aspect}\n\n{localization}"
-
-    image_url = generate_image(api_key, prompt, img_b64, ratio)
-
-    return {
-        "original_name": file.name,
-        "generated_image": image_url,
-    }
+    Process all images in TRUE parallel using asyncio.
+    """
+    # Create a single session for connection pooling
+    connector = aiohttp.TCPConnector(limit=MAX_WORKERS)
+    
+    async with aiohttp.ClientSession(connector=connector) as session:
+        # Create all tasks
+        tasks = [
+            async_process_single_image(
+                session, api_key, fd, language, extra, ratio, i
+            )
+            for i, fd in enumerate(file_data_list)
+        ]
+        
+        # Run ALL tasks concurrently and gather results
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        return results
 
 # -------------------------------------------------
 # STREAMLIT APP
@@ -322,70 +353,90 @@ def main():
             st.stop()
 
     # -------------------------------------------------
-    # PRE-READ ALL FILES IN MAIN THREAD (CRITICAL FIX)
+    # PRE-READ ALL FILES IN MAIN THREAD
     # -------------------------------------------------
-    # Streamlit's UploadedFile objects are NOT thread-safe.
-    # We must read all bytes in the main thread before passing to workers.
     
-    file_data = []
+    file_data_list = []
     for f in files:
-        file_data.append({
-            "bytes": f.getvalue(),      # Read bytes in main thread
+        file_data_list.append({
+            "bytes": f.getvalue(),
             "name": f.name,
             "type": f.type,
         })
     
-    st.info(f"🚀 Processing {len(file_data)} images in parallel (up to {min(MAX_WORKERS, len(file_data))} concurrent)...")
-
-    progress = st.progress(0)
-    status_text = st.empty()
-    output_container = st.container()
+    num_images = len(file_data_list)
+    #st.info(f"🚀 Processing {num_images} images...")
 
     # Clear previous results
     st.session_state.results = []
 
-    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(file_data))) as executor:
-        # Submit all tasks with pre-read bytes
-        futures = {
-            executor.submit(
-                process_image_from_bytes,
-                api_key,
-                fd["bytes"],
-                fd["name"],
-                fd["type"],
-                language,
-                extra,
-                ratio
-            ): fd["name"]
-            for fd in file_data
-        }
+    # -------------------------------------------------
+    # RUN ASYNC PROCESSING
+    # -------------------------------------------------
+    
+    overall_start = time.time()
+    
+    with st.spinner(f"Processing {num_images} images..."):
+        # Run the async function
+        results = asyncio.run(
+            process_all_images_async(
+                api_key, file_data_list, language, extra, ratio
+            )
+        )
+    
+    overall_elapsed = time.time() - overall_start
 
-        completed = 0
-        for future in as_completed(futures):
-            file_name = futures[future]
-            try:
-                result = future.result()
-                st.session_state.results.append(result)
+    # -------------------------------------------------
+    # DISPLAY RESULTS SIDE-BY-SIDE
+    # -------------------------------------------------
+    
+    st.subheader("📊 Result")
+    
+    # Show timing summary
+    successful = [r for r in results if isinstance(r, dict) and r.get("success")]
+    failed = [r for r in results if isinstance(r, dict) and not r.get("success")]
 
-                with output_container:
-                    st.image(result["generated_image"], caption=result["original_name"])
 
-            except Exception as e:
-                st.error(f"❌ Failed to process {file_name}: {str(e)}")
 
-            completed += 1
-            progress.progress(completed / len(file_data))
-            status_text.text(f"Completed {completed}/{len(file_data)} images")
+    st.info(f"Successful: {len(successful)}/{num_images}")
 
-    progress.empty()
-    status_text.empty()
-    st.success(f"✅ Processed {len(st.session_state.results)} images successfully")
+    
+
+    st.divider()
+
+    # Sort results by original index to maintain order
+    sorted_results = sorted(
+        [r for r in results if isinstance(r, dict)],
+        key=lambda x: x.get("index", 0)
+    )
+
+    # Display each result side-by-side
+    for result in sorted_results:
+        if result.get("success"):
+            st.session_state.results.append(result)
+            
+            st.markdown(f"### 📷 {result['original_name']} *(processed in {result['elapsed_seconds']}s)*")
+            
+            # Side-by-side display
+            col_orig, col_gen = st.columns(2)
+            
+            with col_orig:
+                st.markdown("**Original**")
+                st.image(result["original_b64"], use_container_width=True)
+            
+            with col_gen:
+                st.markdown("**Generated**")
+                st.image(result["generated_image"], use_container_width=True)
+            
+            st.divider()
+        else:
+            st.error(f"❌ Failed: {result['original_name']} - {result.get('error', 'Unknown error')}")
 
     # -------------------------------------------------
     # DRIVE UPLOAD (SERIAL, AFTER ALL DONE)
     # -------------------------------------------------
 
-    if drive_enabled:
+    if drive_enabled and st.session_state.results:
         st.subheader("Uploading to Google Drive")
         for item in st.session_state.results:
             header, encoded = item["generated_image"].split(",", 1)
@@ -403,24 +454,25 @@ def main():
         st.success("✅ All images uploaded to Google Drive")
 
     # -------------------------------------------------
-    # ZIP DOWNLOAD (CORRECT & VERIFIED)
+    # ZIP DOWNLOAD
     # -------------------------------------------------
 
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for item in st.session_state.results:
-            header, encoded = item["generated_image"].split(",", 1)
-            zipf.writestr(
-                f"generated_{item['original_name']}",
-                base64.b64decode(encoded),
-            )
+    if st.session_state.results:
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zipf:
+            for item in st.session_state.results:
+                header, encoded = item["generated_image"].split(",", 1)
+                zipf.writestr(
+                    f"generated_{item['original_name']}",
+                    base64.b64decode(encoded),
+                )
 
-    st.download_button(
-        "Download All Images (ZIP)",
-        zip_buffer.getvalue(),
-        "generated_images.zip",
-        "application/zip",
-    )
+        st.download_button(
+            "📥 Download All Images (ZIP)",
+            zip_buffer.getvalue(),
+            "generated_images.zip",
+            "application/zip",
+        )
 
 if __name__ == "__main__":
     main()
